@@ -1,0 +1,18 @@
+[package]
+name = "bevy_slt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Bevy integration for SuperLightTUI (slt)"
+readme = "README.md"
+keywords = ["bevy", "tui", "terminal", "slt"]
+categories = ["gui", "game-development"]
+
+[dependencies]
+bevy_app = "0.18.1"
+bevy_ecs = "0.18.1"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+superlighttui = { version = "0.22.0", default-features = false }
+
+[dev-dependencies]
+bevy = { version = "0.18.1", default-features = false, features = ["bevy_log"] }
