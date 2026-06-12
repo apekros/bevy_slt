@@ -45,6 +45,7 @@ pub struct SltContext {
     state: AppState,
     config: RunConfig,
     events: Vec<Event>,
+    last_mouse_pos: Option<(u32, u32)>,
 }
 
 impl SltContext {
@@ -64,11 +65,18 @@ impl SltContext {
             state: AppState::new(),
             config,
             events: Vec::new(),
+            last_mouse_pos: None,
         })
     }
 
     /// Draw one SLT frame to the real terminal.
     pub fn draw(&mut self, mut render: impl FnMut(&mut Context)) -> io::Result<bool> {
+        if let Some((x, y)) = self.last_mouse_pos
+            && !self.events.iter().any(Event::is_mouse)
+        {
+            self.events.push(Event::mouse_move(x, y));
+        }
+
         slt::frame_owned(
             &mut self.terminal,
             &mut self.state,
@@ -83,10 +91,25 @@ impl SltContext {
         &mut self.config
     }
 
+    /// Enables or disables terminal mouse capture for future frames.
+    pub fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
+        self.config.mouse = enabled;
+        self.terminal.set_mouse_capture(enabled)
+    }
+
     /// Queue an event for the next call to [`SltContext::draw`].
     pub fn push_event(&mut self, event: Event) {
-        if let Event::Resize(width, height) = event {
-            let _ = self.terminal.resize(width, height);
+        match &event {
+            Event::Resize(width, height) => {
+                let _ = self.terminal.resize(*width, *height);
+            }
+            Event::Mouse(mouse) => {
+                self.last_mouse_pos = Some((mouse.x, mouse.y));
+            }
+            Event::FocusLost => {
+                self.last_mouse_pos = None;
+            }
+            _ => {}
         }
         self.events.push(event);
     }
@@ -98,6 +121,7 @@ struct SltTerminal {
     previous: Buffer,
     color_depth: ColorDepth,
     entered: bool,
+    mouse_enabled: bool,
 }
 
 impl SltTerminal {
@@ -126,7 +150,23 @@ impl SltTerminal {
             previous: Buffer::empty(area),
             color_depth: config.color_depth.unwrap_or_else(ColorDepth::detect),
             entered: true,
+            mouse_enabled: config.mouse,
         })
+    }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
+        if self.mouse_enabled == enabled {
+            return Ok(());
+        }
+
+        if enabled {
+            execute!(self.stdout, EnableMouseCapture)?;
+        } else {
+            execute!(self.stdout, DisableMouseCapture)?;
+        }
+        self.stdout.flush()?;
+        self.mouse_enabled = enabled;
+        Ok(())
     }
 
     fn resize(&mut self, width: u32, height: u32) -> io::Result<()> {
@@ -314,9 +354,9 @@ fn to_crossterm_color(color: Color, color_depth: ColorDepth) -> CtColor {
 }
 
 fn init_terminal_context(world: &mut World) {
-    match SltContext::init() {
-        Ok(mut context) => {
-            context.config_mut().mouse = true;
+    let config = RunConfig::default().mouse(true);
+    match SltContext::init_with(config) {
+        Ok(context) => {
             world.insert_non_send_resource(context);
         }
         Err(error) => {

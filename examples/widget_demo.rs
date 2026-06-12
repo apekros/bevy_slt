@@ -168,9 +168,19 @@ fn render_widgets(ui: &mut slt::Context, demo: &mut DemoState) {
 }
 
 fn render_data(ui: &mut slt::Context, demo: &mut DemoState, sparkline: &[f64]) {
+    let plain_keyboard_nav = ui.raw_key_code(KeyCode::Up)
+        || ui.raw_key_code(KeyCode::Down)
+        || ui.raw_key_code(KeyCode::Char('k'))
+        || ui.raw_key_code(KeyCode::Char('j'))
+        || ui.raw_key_code(KeyCode::PageUp)
+        || ui.raw_key_code(KeyCode::PageDown);
+
     let _ = ui.bordered(Border::Rounded).title("Table").p(1).col(|ui| {
         let _ = ui.table(&mut demo.table);
     });
+    if plain_keyboard_nav {
+        demo.table.clear_selection();
+    }
 
     let _ = ui
         .bordered(Border::Rounded)
