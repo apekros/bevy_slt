@@ -1,10 +1,12 @@
 [package]
 name = "bevy_slt"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Bevy integration for SuperLightTUI (slt)"
 readme = "README.md"
+repository = "https://github.com/apekros/bevy_slt"
+documentation = "https://docs.rs/bevy_slt"
 keywords = ["bevy", "tui", "terminal", "slt"]
 categories = ["gui", "game-development"]
 
