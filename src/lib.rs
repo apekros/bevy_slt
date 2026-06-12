@@ -245,7 +245,7 @@ impl Plugin for SltHeadlessPlugin {
             .ok()
             .and_then(|mut slot| slot.take())
             .unwrap_or_default();
-        app.insert_non_send_resource(SltContext::headless(self.width, self.height, config))
+        app.insert_non_send(SltContext::headless(self.width, self.height, config))
             .init_resource::<SltOutput>()
             .add_systems(PostUpdate, publish_headless_output);
     }

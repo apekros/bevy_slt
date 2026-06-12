@@ -1,6 +1,6 @@
 [package]
 name = "bevy_slt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Bevy integration for SuperLightTUI (slt)"
@@ -17,14 +17,20 @@ default = ["terminal"]
 terminal = ["dep:crossterm", "superlighttui/crossterm"]
 
 [dependencies]
-bevy_app = "0.18.1"
-bevy_ecs = "0.18.1"
+bevy_app = "0.19.0-rc.3"
+bevy_ecs = "0.19.0-rc.3"
 # Must track the crossterm version superlighttui depends on.
-crossterm = { version = "0.28", features = ["bracketed-paste"], optional = true }
-superlighttui = { version = "0.22.0", default-features = false, features = ["bidi"] }
+crossterm = { version = "0.28", features = [
+  "bracketed-paste",
+], optional = true }
+superlighttui = { version = "0.22.0", default-features = false, features = [
+  "bidi",
+] }
 
 [dev-dependencies]
-bevy = { version = "0.18.1", default-features = false, features = ["bevy_log"] }
+bevy = { version = "0.19.0-rc.3", default-features = false, features = [
+  "bevy_log",
+] }
 
 [[example]]
 name = "widget_demo"

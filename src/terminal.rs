@@ -179,7 +179,7 @@ fn init_terminal_context(world: &mut World) -> Result {
         .map(|pending| pending.0)
         .unwrap_or_default();
     let context = SltContext::terminal(config)?;
-    world.insert_non_send_resource(context);
+    world.insert_non_send(context);
     Ok(())
 }
 

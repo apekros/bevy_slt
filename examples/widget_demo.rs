@@ -11,7 +11,7 @@ use slt::{
 fn main() {
     let frame_time = Duration::from_secs_f32(1.0 / 30.0);
     App::new()
-        .insert_non_send_resource(DemoState::new())
+        .insert_non_send(DemoState::new())
         .add_plugins((
             MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(frame_time)),
             SltTerminalPlugin::new(RunConfig::default().mouse(true)),

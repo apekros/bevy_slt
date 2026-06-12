@@ -77,3 +77,12 @@ assert!(output.text.contains("hello from slt"));
 
 Headless-only consumers can depend on `bevy_slt` with
 `default-features = false` to skip the terminal machinery entirely.
+
+## Compatibility
+
+| bevy_slt | Bevy |
+| --- | --- |
+| 0.1.x | 0.18 |
+| 0.2.x | 0.19 |
+
+
