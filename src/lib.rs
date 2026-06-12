@@ -1,94 +1,101 @@
 //! Bevy integration for [`slt`](https://docs.rs/superlighttui/latest/slt/).
 //!
-//! This crate drives SLT's custom backend API from a Bevy `Update` system. It
-//! renders into [`SltOutput`], which you can display with Bevy UI, a texture, a
-//! debug overlay, or anything else that can consume a terminal-cell grid.
+//! Draw an SLT UI from a Bevy system by calling [`SltContext::draw`] on a
+//! context resource. Two backends are provided:
+//!
+//! - [`SltTerminalPlugin`] (feature `terminal`, on by default) renders to the
+//!   real terminal, forwards terminal input as Bevy messages, and restores the
+//!   terminal on exit or panic.
+//! - [`SltHeadlessPlugin`] renders to an in-memory buffer and publishes each
+//!   frame as the [`SltOutput`] resource, for display via Bevy UI, a texture,
+//!   or assertions in tests.
 
+#[cfg(feature = "terminal")]
 mod terminal;
 
-pub use crate::terminal::{SltContext, SltTerminalPlugin};
+#[cfg(feature = "terminal")]
+pub use crate::terminal::{
+    SltFocusMessage, SltKeyMessage, SltMouseMessage, SltPasteMessage, SltResizeMessage,
+    SltTerminalContext, SltTerminalPlugin, TerminalBackend, restore_terminal,
+};
 
-use bevy_app::{App, Plugin, Update};
+use bevy_app::{App, Plugin, PostUpdate};
 use bevy_ecs::prelude::*;
 use slt::{AppState, Backend, Buffer, Cell, Context, Event, Rect, RunConfig};
 use std::io;
+use std::sync::Mutex;
 
-/// Adds the SLT render system and default resources.
+/// A surface [`SltContext`] can drive: an slt [`Backend`] that can also resize
+/// and expose the last completed frame.
+pub trait SltBackend: Backend {
+    /// Resizes the backing surface to the given cell dimensions.
+    fn resize(&mut self, width: u32, height: u32) -> io::Result<()>;
+
+    /// The last frame that completed a [`Backend::flush`].
+    fn frame_buffer(&self) -> &Buffer;
+}
+
+/// An SLT session (persistent [`AppState`], [`RunConfig`], pending input)
+/// driven from Bevy systems.
 ///
-/// Add a render closure with [`SltAppExt::insert_slt_ui`].
-#[derive(Debug, Default)]
-pub struct SltPlugin;
-
-/// System sets exposed by this crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SystemSet)]
-pub enum SltSet {
-    /// Runs the configured SLT closure and writes [`SltOutput`].
-    Render,
-}
-
-impl Plugin for SltPlugin {
-    fn build(&self, app: &mut App) {
-        app.init_resource::<SltEvents>()
-            .init_resource::<SltOutput>()
-            .init_non_send_resource::<SltState>()
-            .add_systems(Update, render_slt.in_set(SltSet::Render));
-    }
-}
-
-/// Extension methods for wiring an SLT UI closure into a Bevy app.
-pub trait SltAppExt {
-    /// Inserts the immediate-mode SLT closure that will run once per Bevy update.
-    fn insert_slt_ui<F>(&mut self, render: F) -> &mut Self
-    where
-        F: FnMut(&mut Context) + 'static;
-}
-
-impl SltAppExt for App {
-    fn insert_slt_ui<F>(&mut self, render: F) -> &mut Self
-    where
-        F: FnMut(&mut Context) + 'static,
-    {
-        self.insert_non_send_resource(SltRender::new(render))
-    }
-}
-
-/// Persistent SLT runtime state.
-///
-/// This is a Bevy non-send resource because `slt::AppState` is intentionally not
-/// `Send`/`Sync`.
-pub struct SltState {
-    app: AppState,
-    backend: SltBackend,
+/// This is a Bevy non-send resource because slt's `AppState` holds
+/// `Box<dyn Any>` hook state and is intentionally not `Send`.
+pub struct SltContext<B: SltBackend> {
+    backend: B,
+    state: AppState,
     config: RunConfig,
-    keep_going: bool,
-    last_error: Option<io::Error>,
+    events: Vec<Event>,
+    last_mouse_pos: Option<(u32, u32)>,
 }
 
-impl SltState {
-    /// Creates state with an 80x24-cell surface and the default SLT config.
-    pub fn new() -> Self {
-        Self::with_size(80, 24)
-    }
-
-    /// Creates state with the requested cell dimensions.
-    pub fn with_size(width: u32, height: u32) -> Self {
+impl<B: SltBackend> SltContext<B> {
+    fn from_parts(backend: B, config: RunConfig) -> Self {
         Self {
-            app: AppState::new(),
-            backend: SltBackend::new(width, height),
-            config: RunConfig::default(),
-            keep_going: true,
-            last_error: None,
+            backend,
+            state: AppState::new(),
+            config,
+            events: Vec::new(),
+            last_mouse_pos: None,
         }
     }
 
-    /// Returns the configured cell dimensions.
-    pub fn size(&self) -> (u32, u32) {
-        self.backend.size()
+    /// Renders one SLT frame, consuming the events queued since the last call.
+    ///
+    /// Returns `Ok(false)` after the UI calls `Context::quit()`; map that to
+    /// [`bevy_app::AppExit`] in your system if quitting should end the app.
+    pub fn draw(&mut self, mut render: impl FnMut(&mut Context)) -> io::Result<bool> {
+        // slt only persists the hover position inside its built-in run loop;
+        // the frame() path forgets it between frames. Re-feed the last known
+        // position whenever this frame carries no fresher mouse event so
+        // hover states survive event-free frames.
+        if let Some((x, y)) = self.last_mouse_pos
+            && !self.events.iter().any(Event::is_mouse)
+        {
+            self.events.push(Event::mouse_move(x, y));
+        }
+
+        slt::frame_owned(
+            &mut self.backend,
+            &mut self.state,
+            &self.config,
+            std::mem::take(&mut self.events),
+            &mut render,
+        )
     }
 
-    /// Resizes the backing SLT surface.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.backend.resize(width, height);
+    /// Queues an input event for the next [`SltContext::draw`].
+    ///
+    /// Resize events resize the backend immediately; mouse and focus events
+    /// update the persistent hover position.
+    pub fn push_event(&mut self, event: Event) -> io::Result<()> {
+        match &event {
+            Event::Resize(width, height) => self.backend.resize(*width, *height)?,
+            Event::Mouse(mouse) => self.last_mouse_pos = Some((mouse.x, mouse.y)),
+            Event::FocusLost => self.last_mouse_pos = None,
+            _ => {}
+        }
+        self.events.push(event);
+        Ok(())
     }
 
     /// Immutable access to the SLT run config.
@@ -101,59 +108,157 @@ impl SltState {
         &mut self.config
     }
 
-    /// `false` after the UI calls `Context::quit()` or a frame error occurs.
-    pub fn keep_going(&self) -> bool {
-        self.keep_going
+    /// The current cell dimensions.
+    pub fn size(&self) -> (u32, u32) {
+        self.backend.size()
     }
 
-    /// The last frame error, if rendering failed.
-    pub fn last_error(&self) -> Option<&io::Error> {
-        self.last_error.as_ref()
+    /// Resizes the backing surface.
+    pub fn resize(&mut self, width: u32, height: u32) -> io::Result<()> {
+        self.backend.resize(width, height)
     }
 
-    /// The underlying SLT buffer for advanced integrations.
-    pub fn buffer(&self) -> &Buffer {
-        &self.backend.buffer
+    /// The last completed frame.
+    pub fn frame_buffer(&self) -> &Buffer {
+        self.backend.frame_buffer()
+    }
+
+    #[cfg(feature = "terminal")]
+    pub(crate) fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
     }
 }
 
-impl Default for SltState {
-    fn default() -> Self {
-        Self::new()
+/// In-memory backend with no terminal attached.
+pub struct HeadlessBackend {
+    target: Buffer,
+    frame: Buffer,
+}
+
+impl HeadlessBackend {
+    /// Creates a backend with the requested cell dimensions.
+    pub fn new(width: u32, height: u32) -> Self {
+        let area = Rect::new(0, 0, width, height);
+        Self {
+            target: Buffer::empty(area),
+            frame: Buffer::empty(area),
+        }
     }
 }
 
-/// Input events that will be passed into the next SLT frame.
+impl Backend for HeadlessBackend {
+    fn size(&self) -> (u32, u32) {
+        (self.target.area.width, self.target.area.height)
+    }
+
+    fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.target
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // Publish the rendered frame and hand the kernel a clean buffer for
+        // the next one; the backend owns clearing, not the frame kernel.
+        std::mem::swap(&mut self.target, &mut self.frame);
+        self.target.reset();
+        Ok(())
+    }
+}
+
+impl SltBackend for HeadlessBackend {
+    fn resize(&mut self, width: u32, height: u32) -> io::Result<()> {
+        let area = Rect::new(0, 0, width, height);
+        if self.target.area != area {
+            self.target.resize(area);
+            self.frame.resize(area);
+        }
+        Ok(())
+    }
+
+    fn frame_buffer(&self) -> &Buffer {
+        &self.frame
+    }
+}
+
+/// [`SltContext`] rendering to an in-memory buffer.
+pub type SltHeadlessContext = SltContext<HeadlessBackend>;
+
+impl SltContext<HeadlessBackend> {
+    /// Creates a headless context with the given cell dimensions and config.
+    pub fn headless(width: u32, height: u32, config: RunConfig) -> Self {
+        Self::from_parts(HeadlessBackend::new(width, height), config)
+    }
+}
+
+/// Adds an [`SltHeadlessContext`] non-send resource and publishes each frame
+/// as [`SltOutput`] in `PostUpdate`.
 ///
-/// Systems may push keyboard, mouse, paste, focus, or resize events here. The
-/// render system drains this queue every frame.
-#[derive(Debug, Default, Resource)]
-pub struct SltEvents {
-    events: Vec<Event>,
+/// With the `terminal` feature enabled (the default), slt probes terminal
+/// capabilities once on the first frame, writing a few escape codes to
+/// stdout. Headless-only consumers can avoid that by depending on `bevy_slt`
+/// with `default-features = false`.
+///
+/// Draw from your own system:
+///
+/// ```ignore
+/// fn draw(mut context: NonSendMut<SltHeadlessContext>) -> Result {
+///     context.draw(|ui| ui.text("hello"))?;
+///     Ok(())
+/// }
+/// ```
+pub struct SltHeadlessPlugin {
+    width: u32,
+    height: u32,
+    // RunConfig is not Clone, and Plugin::build only gets `&self`.
+    config: Mutex<Option<RunConfig>>,
 }
 
-impl SltEvents {
-    /// Queue a single event for the next frame.
-    pub fn push(&mut self, event: Event) {
-        self.events.push(event);
+impl SltHeadlessPlugin {
+    /// Creates a plugin with the requested cell dimensions.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            config: Mutex::new(None),
+        }
     }
 
-    /// Queue multiple events for the next frame.
-    pub fn extend(&mut self, events: impl IntoIterator<Item = Event>) {
-        self.events.extend(events);
-    }
-
-    /// Clears queued events without rendering them.
-    pub fn clear(&mut self) {
-        self.events.clear();
-    }
-
-    fn drain(&mut self) -> Vec<Event> {
-        self.events.drain(..).collect()
+    /// Sets the SLT run config for the context.
+    pub fn config(self, config: RunConfig) -> Self {
+        Self {
+            config: Mutex::new(Some(config)),
+            ..self
+        }
     }
 }
 
-/// The latest rendered SLT frame, as both text and cells.
+impl Default for SltHeadlessPlugin {
+    fn default() -> Self {
+        Self::new(80, 24)
+    }
+}
+
+impl Plugin for SltHeadlessPlugin {
+    fn build(&self, app: &mut App) {
+        let config = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_default();
+        app.insert_non_send_resource(SltContext::headless(self.width, self.height, config))
+            .init_resource::<SltOutput>()
+            .add_systems(PostUpdate, publish_headless_output);
+    }
+}
+
+fn publish_headless_output(context: NonSend<SltHeadlessContext>, mut output: ResMut<SltOutput>) {
+    output.update_from(context.frame_buffer());
+}
+
+/// The latest rendered headless frame, as both text and cells.
+///
+/// Unlike [`SltHeadlessContext`] this is a plain `Send` resource, so parallel
+/// systems (text display, texture upload) can read it freely.
 #[derive(Debug, Default, Clone, Resource)]
 pub struct SltOutput {
     /// Terminal-cell width.
@@ -177,148 +282,87 @@ impl SltOutput {
         self.cells.get(index)
     }
 
-    fn update_from(&mut self, backend: &SltBackend) {
-        let (width, height) = backend.size();
-        self.width = width;
-        self.height = height;
-        self.cells.clone_from(&backend.buffer.content);
-        self.text = backend.to_plain_text();
-    }
-}
+    fn update_from(&mut self, buffer: &Buffer) {
+        self.width = buffer.area.width;
+        self.height = buffer.area.height;
+        self.cells.clone_from(&buffer.content);
 
-/// Non-send render closure resource used by [`SltPlugin`].
-pub struct SltRender {
-    render: Box<dyn FnMut(&mut Context) + 'static>,
-}
-
-impl SltRender {
-    /// Creates a render closure resource.
-    pub fn new<F>(render: F) -> Self
-    where
-        F: FnMut(&mut Context) + 'static,
-    {
-        Self {
-            render: Box::new(render),
-        }
-    }
-}
-
-struct SltBackend {
-    buffer: Buffer,
-}
-
-impl SltBackend {
-    fn new(width: u32, height: u32) -> Self {
-        Self {
-            buffer: Buffer::empty(Rect::new(0, 0, width, height)),
-        }
-    }
-
-    fn resize(&mut self, width: u32, height: u32) {
-        let area = Rect::new(0, 0, width, height);
-        if self.buffer.area != area {
-            self.buffer.resize(area);
-        }
-    }
-
-    fn to_plain_text(&self) -> String {
-        let width = self.buffer.area.width;
-        let height = self.buffer.area.height;
-        let mut text = String::new();
-
-        for y in 0..height {
+        self.text.clear();
+        for y in 0..self.height {
             if y > 0 {
-                text.push('\n');
+                self.text.push('\n');
             }
-
-            for x in 0..width {
-                if let Some(cell) = self.buffer.try_get(x, y) {
-                    text.push_str(cell.symbol.as_str());
+            for x in 0..self.width {
+                if let Some(cell) = buffer.try_get(x, y) {
+                    self.text.push_str(cell.symbol.as_str());
                 }
             }
-        }
-
-        text
-    }
-}
-
-impl Backend for SltBackend {
-    fn size(&self) -> (u32, u32) {
-        (self.buffer.area.width, self.buffer.area.height)
-    }
-
-    fn buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffer
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn render_slt(
-    mut state: NonSendMut<SltState>,
-    mut render: Option<NonSendMut<SltRender>>,
-    mut events: ResMut<SltEvents>,
-    mut output: ResMut<SltOutput>,
-) {
-    let Some(render) = render.as_deref_mut() else {
-        return;
-    };
-
-    if !state.keep_going {
-        return;
-    }
-
-    let events = events.drain();
-    let state = &mut *state;
-    let SltState {
-        app,
-        backend,
-        config,
-        keep_going,
-        last_error,
-    } = state;
-
-    match slt::frame(backend, app, config, &events, &mut render.render) {
-        Ok(continue_running) => {
-            *keep_going = continue_running;
-            *last_error = None;
-            output.update_from(backend);
-        }
-        Err(error) => {
-            *keep_going = false;
-            *last_error = Some(error);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::{SltAppExt, SltEvents, SltOutput, SltPlugin, SltState};
+    use crate::{SltHeadlessContext, SltHeadlessPlugin, SltOutput};
     use bevy_app::App;
+    use bevy_ecs::error::Result;
+    use bevy_ecs::prelude::*;
     use slt::Event;
 
     #[test]
-    fn renders_slt_closure_into_output() {
+    fn headless_plugin_publishes_output() -> Result {
         let mut app = App::new();
-        app.add_plugins(SltPlugin).insert_slt_ui(|ui| {
-            ui.text("hello, bevy");
-        });
+        app.add_plugins(SltHeadlessPlugin::default()).add_systems(
+            bevy_app::Update,
+            |mut context: NonSendMut<SltHeadlessContext>| -> Result {
+                context.draw(|ui| {
+                    ui.text("hello, bevy");
+                })?;
+                Ok(())
+            },
+        );
 
         app.update();
 
         let output = app.world().resource::<SltOutput>();
-        assert!(output.text.contains("hello, bevy"));
+        assert!(output.text.contains("hello, bevy"), "{:?}", output.text);
+        Ok(())
     }
 
     #[test]
-    fn drains_queued_events() {
-        let mut events = SltEvents::default();
-        events.push(Event::key_char('x'));
+    fn resize_event_resizes_backend() -> Result {
+        let mut context = SltHeadlessContext::headless(10, 5, slt::RunConfig::default());
+        context.push_event(Event::resize(20, 8))?;
 
-        assert_eq!(events.drain().len(), 1);
-        assert!(events.drain().is_empty());
+        assert_eq!(context.size(), (20, 8));
+        Ok(())
+    }
+
+    #[test]
+    fn hover_survives_event_free_frames() -> Result {
+        let mut context = SltHeadlessContext::headless(40, 6, slt::RunConfig::default());
+
+        // Frame 1 registers the button's hit area.
+        context.draw(|ui| {
+            let _ = ui.button("press me");
+        })?;
+
+        // Frame 2 moves the mouse over the button.
+        context.push_event(Event::mouse_move(2, 0))?;
+        let mut hovered = false;
+        context.draw(|ui| {
+            hovered = ui.button("press me").hovered;
+        })?;
+        assert!(hovered, "mouse move over the button must hover it");
+
+        // Frame 3 has no events; the synthetic mouse position must keep the
+        // hover alive.
+        let mut still_hovered = false;
+        context.draw(|ui| {
+            still_hovered = ui.button("press me").hovered;
+        })?;
+        assert!(still_hovered, "hover must survive an event-free frame");
+        Ok(())
     }
 
     #[test]
@@ -334,13 +378,5 @@ mod tests {
 
         output.cells.push(Default::default());
         assert!(output.cell(0, 0).is_some());
-    }
-
-    #[test]
-    fn state_can_resize() {
-        let mut state = SltState::with_size(10, 5);
-        state.resize(20, 8);
-
-        assert_eq!(state.size(), (20, 8));
     }
 }

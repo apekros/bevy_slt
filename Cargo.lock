@@ -1626,7 +1626,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c20e92bbc95fd754a875d6ff87b520183b80149fc5fbc83a57aa1811e5e9291e"
 dependencies = [
  "compact_str",
+ "crossterm",
+ "signal-hook",
  "smallvec",
+ "unicode-bidi",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1831,6 +1834,12 @@ name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-ident"

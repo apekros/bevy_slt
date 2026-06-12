@@ -8,11 +8,24 @@ readme = "README.md"
 keywords = ["bevy", "tui", "terminal", "slt"]
 categories = ["gui", "game-development"]
 
+[features]
+default = ["terminal"]
+# Real-terminal rendering. Also enables slt's own `crossterm` feature so the
+# in-frame paths it gates (text selection, clipboard, capability probing) are
+# compiled in. Headless-only consumers can disable this and skip the terminal
+# machinery entirely.
+terminal = ["dep:crossterm", "superlighttui/crossterm"]
+
 [dependencies]
 bevy_app = "0.18.1"
 bevy_ecs = "0.18.1"
-crossterm = { version = "0.28", features = ["bracketed-paste"] }
-superlighttui = { version = "0.22.0", default-features = false }
+# Must track the crossterm version superlighttui depends on.
+crossterm = { version = "0.28", features = ["bracketed-paste"], optional = true }
+superlighttui = { version = "0.22.0", default-features = false, features = ["bidi"] }
 
 [dev-dependencies]
 bevy = { version = "0.18.1", default-features = false, features = ["bevy_log"] }
+
+[[example]]
+name = "widget_demo"
+required-features = ["terminal"]

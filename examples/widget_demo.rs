@@ -2,10 +2,10 @@ use std::time::{Duration, Instant};
 
 use bevy::app::{AppExit, ScheduleRunnerPlugin};
 use bevy::prelude::*;
-use bevy_slt::{SltContext, SltTerminalPlugin};
+use bevy_slt::{SltTerminalContext, SltTerminalPlugin};
 use slt::{
-    AlertLevel, Border, Color, KeyCode, KeyModifiers, ListState, SpinnerState, TableState,
-    TabsState, TextInputState,
+    AlertLevel, Border, Color, KeyCode, ListState, RunConfig, SpinnerState, TableState, TabsState,
+    TextInputState,
 };
 
 fn main() {
@@ -14,7 +14,7 @@ fn main() {
         .insert_non_send_resource(DemoState::new())
         .add_plugins((
             MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(frame_time)),
-            SltTerminalPlugin,
+            SltTerminalPlugin::new(RunConfig::default().mouse(true)),
         ))
         .add_systems(Update, draw_demo)
         .run();
@@ -62,13 +62,14 @@ impl DemoState {
 }
 
 fn draw_demo(
-    mut context: NonSendMut<SltContext>,
+    mut context: NonSendMut<SltTerminalContext>,
     mut demo: NonSendMut<DemoState>,
     mut exit: MessageWriter<AppExit>,
-) {
+) -> Result {
     let demo = &mut *demo;
-    let keep_going = match context.draw(|ui| {
-        if ui.key('q') || ui.key_code(KeyCode::Esc) || ui.key_mod('c', KeyModifiers::CONTROL) {
+    // Ctrl+C is handled by SltTerminalPlugin; q and Esc are this app's choice.
+    let keep_going = context.draw(|ui| {
+        if ui.key('q') || ui.key_code(KeyCode::Esc) {
             ui.quit();
         }
 
@@ -102,17 +103,12 @@ fn draw_demo(
                     _ => render_data(ui, demo, &sparkline),
                 }
             });
-    }) {
-        Ok(keep_going) => keep_going,
-        Err(_) => {
-            exit.write(AppExit::error());
-            return;
-        }
-    };
+    })?;
 
     if !keep_going {
         exit.write(AppExit::Success);
     }
+    Ok(())
 }
 
 fn render_overview(ui: &mut slt::Context, demo: &mut DemoState, progress: f64) {

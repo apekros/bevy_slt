@@ -1,7 +1,10 @@
 use std::io::{self, BufWriter, IsTerminal, Stdout, Write};
+use std::sync::{Mutex, Once};
+use std::time::Duration;
 
-use bevy_app::{App, AppExit, Plugin, PreStartup, PreUpdate};
-use bevy_ecs::message::MessageWriter;
+use bevy_app::{App, AppExit, Plugin, PreUpdate, Startup};
+use bevy_ecs::error::Result;
+use bevy_ecs::message::{Message, MessageReader, MessageWriter};
 use bevy_ecs::prelude::*;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
@@ -18,104 +21,222 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use slt::{
-    AppState, Backend, Buffer, Color, ColorDepth, Context, Event, KeyCode, KeyModifiers, Modifiers,
-    MouseButton, MouseEvent, MouseKind, Rect, RunConfig, Style, UnderlineStyle,
+    Backend, Buffer, Color, ColorDepth, Event, KeyCode, KeyEvent, KeyModifiers, ModifierKey,
+    Modifiers, MouseButton, MouseEvent, MouseKind, Rect, RunConfig, Style, UnderlineStyle,
 };
 
-/// Terminal-backed SLT plugin, modeled after `bevy_ratatui`.
-///
-/// This installs a [`SltContext`] resource. Draw from a Bevy system by calling
-/// [`SltContext::draw`], instead of serializing [`crate::SltOutput`] yourself.
-#[derive(Debug, Default)]
-pub struct SltTerminalPlugin;
+use crate::SltContext;
 
-impl Plugin for SltTerminalPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_systems(PreStartup, init_terminal_context)
-            .add_systems(PreUpdate, poll_terminal_events);
-    }
-}
+/// [`SltContext`] rendering to the real terminal.
+pub type SltTerminalContext = SltContext<TerminalBackend>;
 
-/// A Bevy resource that owns an SLT terminal session and frame state.
-///
-/// The shape mirrors `bevy_ratatui::RatatuiContext`: put the terminal context in
-/// ECS, then let the TUI library's frame machinery render into its backend.
-pub struct SltContext {
-    terminal: SltTerminal,
-    state: AppState,
-    config: RunConfig,
-    events: Vec<Event>,
-    last_mouse_pos: Option<(u32, u32)>,
-}
-
-impl SltContext {
-    /// Enters raw mode and the alternate screen.
-    pub fn init() -> io::Result<Self> {
-        Self::init_with(RunConfig::default())
-    }
-
+impl SltContext<TerminalBackend> {
     /// Enters raw mode and the alternate screen with the supplied SLT config.
-    pub fn init_with(config: RunConfig) -> io::Result<Self> {
+    pub fn terminal(config: RunConfig) -> io::Result<Self> {
         if !io::stdout().is_terminal() {
             return Err(io::Error::other("stdout is not a terminal"));
         }
 
-        Ok(Self {
-            terminal: SltTerminal::new(&config)?,
-            state: AppState::new(),
-            config,
-            events: Vec::new(),
-            last_mouse_pos: None,
-        })
-    }
-
-    /// Draw one SLT frame to the real terminal.
-    pub fn draw(&mut self, mut render: impl FnMut(&mut Context)) -> io::Result<bool> {
-        if let Some((x, y)) = self.last_mouse_pos
-            && !self.events.iter().any(Event::is_mouse)
-        {
-            self.events.push(Event::mouse_move(x, y));
-        }
-
-        slt::frame_owned(
-            &mut self.terminal,
-            &mut self.state,
-            &self.config,
-            std::mem::take(&mut self.events),
-            &mut render,
-        )
-    }
-
-    /// Mutable access to SLT run configuration.
-    pub fn config_mut(&mut self) -> &mut RunConfig {
-        &mut self.config
+        let backend = TerminalBackend::new(&config)?;
+        Ok(Self::from_parts(backend, config))
     }
 
     /// Enables or disables terminal mouse capture for future frames.
     pub fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
-        self.config.mouse = enabled;
-        self.terminal.set_mouse_capture(enabled)
-    }
-
-    /// Queue an event for the next call to [`SltContext::draw`].
-    pub fn push_event(&mut self, event: Event) {
-        match &event {
-            Event::Resize(width, height) => {
-                let _ = self.terminal.resize(*width, *height);
-            }
-            Event::Mouse(mouse) => {
-                self.last_mouse_pos = Some((mouse.x, mouse.y));
-            }
-            Event::FocusLost => {
-                self.last_mouse_pos = None;
-            }
-            _ => {}
-        }
-        self.events.push(event);
+        self.config_mut().mouse = enabled;
+        self.backend_mut().set_mouse_capture(enabled)
     }
 }
 
-struct SltTerminal {
+/// Terminal-backed SLT plugin, modeled after `bevy_ratatui`.
+///
+/// Installs an [`SltTerminalContext`] non-send resource at startup, forwards
+/// terminal input as Bevy messages ([`SltKeyMessage`], [`SltMouseMessage`],
+/// [`SltFocusMessage`], [`SltPasteMessage`], [`SltResizeMessage`]) in
+/// `PreUpdate`, and restores the terminal on panic. Draw from your own system
+/// by calling [`SltContext::draw`].
+pub struct SltTerminalPlugin {
+    // RunConfig is not Clone, and Plugin::build only gets `&self`.
+    config: Mutex<Option<RunConfig>>,
+    ctrl_c_exit: bool,
+}
+
+impl SltTerminalPlugin {
+    /// Creates the plugin with the given SLT run config.
+    pub fn new(config: RunConfig) -> Self {
+        Self {
+            config: Mutex::new(Some(config)),
+            ctrl_c_exit: true,
+        }
+    }
+
+    /// Whether `Ctrl+C` writes [`AppExit`]. Defaults to `true`.
+    pub fn ctrl_c_exit(mut self, enabled: bool) -> Self {
+        self.ctrl_c_exit = enabled;
+        self
+    }
+}
+
+impl Default for SltTerminalPlugin {
+    fn default() -> Self {
+        Self::new(RunConfig::default())
+    }
+}
+
+/// Startup-only carrier for the plugin's [`RunConfig`].
+#[derive(Resource)]
+struct PendingTerminalConfig(RunConfig);
+
+impl Plugin for SltTerminalPlugin {
+    fn build(&self, app: &mut App) {
+        install_panic_hook();
+
+        let config = self
+            .config
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_default();
+
+        app.insert_resource(PendingTerminalConfig(config))
+            .add_message::<SltKeyMessage>()
+            .add_message::<SltMouseMessage>()
+            .add_message::<SltFocusMessage>()
+            .add_message::<SltPasteMessage>()
+            .add_message::<SltResizeMessage>()
+            .add_systems(Startup, init_terminal_context)
+            .add_systems(PreUpdate, poll_terminal_events);
+
+        if self.ctrl_c_exit {
+            app.add_systems(PreUpdate, ctrl_c_exit_system.after(poll_terminal_events));
+        }
+    }
+}
+
+/// A key event read from the terminal.
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
+pub struct SltKeyMessage(pub KeyEvent);
+
+/// A mouse event read from the terminal.
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
+pub struct SltMouseMessage(pub MouseEvent);
+
+/// The terminal gained or lost focus.
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SltFocusMessage {
+    Gained,
+    Lost,
+}
+
+/// Text pasted into the terminal.
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
+pub struct SltPasteMessage(pub String);
+
+/// The terminal was resized, in cells.
+#[derive(Message, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SltResizeMessage {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Restores the terminal to its normal state.
+///
+/// Safe to call even when the terminal was never entered; used by the panic
+/// hook, which cannot reach the [`SltTerminalContext`] resource.
+pub fn restore_terminal() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        Show,
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
+    disable_raw_mode()
+}
+
+/// Restores the terminal before the panic message prints, so it lands on a
+/// readable screen instead of inside the alternate screen in raw mode.
+fn install_panic_hook() {
+    // Panic hooks are process-global; Once keeps repeated plugin builds from
+    // stacking restore layers.
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let _ = restore_terminal();
+            original(panic_info);
+        }));
+    });
+}
+
+fn init_terminal_context(world: &mut World) -> Result {
+    let config = world
+        .remove_resource::<PendingTerminalConfig>()
+        .map(|pending| pending.0)
+        .unwrap_or_default();
+    let context = SltContext::terminal(config)?;
+    world.insert_non_send_resource(context);
+    Ok(())
+}
+
+fn poll_terminal_events(
+    mut context: NonSendMut<SltTerminalContext>,
+    mut keys: MessageWriter<SltKeyMessage>,
+    mut mouse: MessageWriter<SltMouseMessage>,
+    mut focus: MessageWriter<SltFocusMessage>,
+    mut paste: MessageWriter<SltPasteMessage>,
+    mut resize: MessageWriter<SltResizeMessage>,
+) -> Result {
+    while event::poll(Duration::ZERO)? {
+        let raw = event::read()?;
+        let Some(event) = to_slt_event(raw) else {
+            continue;
+        };
+
+        match &event {
+            Event::Key(key) => {
+                keys.write(SltKeyMessage(key.clone()));
+            }
+            Event::Mouse(mouse_event) => {
+                mouse.write(SltMouseMessage(mouse_event.clone()));
+            }
+            Event::FocusGained => {
+                focus.write(SltFocusMessage::Gained);
+            }
+            Event::FocusLost => {
+                focus.write(SltFocusMessage::Lost);
+            }
+            Event::Paste(text) => {
+                paste.write(SltPasteMessage(text.clone()));
+            }
+            Event::Resize(width, height) => {
+                resize.write(SltResizeMessage {
+                    width: *width,
+                    height: *height,
+                });
+            }
+            _ => {}
+        }
+
+        context.push_event(event)?;
+    }
+    Ok(())
+}
+
+fn ctrl_c_exit_system(mut keys: MessageReader<SltKeyMessage>, mut exit: MessageWriter<AppExit>) {
+    for key in keys.read() {
+        if key.0.is_ctrl_char('c') {
+            exit.write(AppExit::Success);
+        }
+    }
+}
+
+/// Crossterm-backed slt [`Backend`] writing to stdout.
+pub struct TerminalBackend {
     stdout: BufWriter<Stdout>,
     current: Buffer,
     previous: Buffer,
@@ -124,7 +245,7 @@ struct SltTerminal {
     mouse_enabled: bool,
 }
 
-impl SltTerminal {
+impl TerminalBackend {
     fn new(config: &RunConfig) -> io::Result<Self> {
         let (cols, rows) = terminal::size()?;
         let mut stdout = io::stdout();
@@ -169,41 +290,23 @@ impl SltTerminal {
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) -> io::Result<()> {
-        let area = Rect::new(0, 0, width, height);
-        self.current.resize(area);
-        self.previous.resize(area);
-        execute!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        Ok(())
-    }
-
     fn restore(&mut self) -> io::Result<()> {
         if !self.entered {
             return Ok(());
         }
         self.entered = false;
-        execute!(
-            self.stdout,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            Show,
-            DisableMouseCapture,
-            DisableFocusChange,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        )?;
         self.stdout.flush()?;
-        disable_raw_mode()
+        restore_terminal()
     }
 }
 
-impl Drop for SltTerminal {
+impl Drop for TerminalBackend {
     fn drop(&mut self) {
         let _ = self.restore();
     }
 }
 
-impl Backend for SltTerminal {
+impl Backend for TerminalBackend {
     fn size(&self) -> (u32, u32) {
         (self.current.area.width, self.current.area.height)
     }
@@ -213,40 +316,83 @@ impl Backend for SltTerminal {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        queue!(self.stdout, BeginSynchronizedUpdate)?;
+        let width = self.current.area.width;
+        if width > 0 {
+            queue!(self.stdout, BeginSynchronizedUpdate)?;
 
-        if self.current.area != self.previous.area {
-            queue!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
-        }
+            let mut last_style = None;
+            let mut active_link: Option<&str> = None;
+            for (index, cell) in self.current.content.iter().enumerate() {
+                // Wide glyphs leave their trailer cell's symbol empty; the
+                // leading cell's print already covered that column.
+                if cell.symbol.is_empty() {
+                    continue;
+                }
+                if self.previous.content.get(index) == Some(cell) {
+                    continue;
+                }
 
-        let mut last_style = None;
-        for (index, cell) in self.current.content.iter().enumerate() {
-            let previous = self.previous.content.get(index);
-            if previous == Some(cell) {
-                continue;
+                let x = index as u32 % width;
+                let y = index as u32 / width;
+                queue!(self.stdout, MoveTo(x as u16, y as u16))?;
+                if last_style != Some(cell.style) {
+                    queue_style(&mut self.stdout, cell.style, self.color_depth)?;
+                    last_style = Some(cell.style);
+                }
+
+                let link = cell.hyperlink.as_deref().filter(|url| valid_osc8_url(url));
+                if link != active_link {
+                    queue_osc8(&mut self.stdout, link)?;
+                    active_link = link;
+                }
+
+                queue!(self.stdout, Print(cell.symbol.as_str()))?;
+            }
+            if active_link.is_some() {
+                queue_osc8(&mut self.stdout, None)?;
             }
 
-            let x = index as u32 % self.current.area.width;
-            let y = index as u32 / self.current.area.width;
-            queue!(self.stdout, MoveTo(x as u16, y as u16))?;
-            if last_style != Some(cell.style) {
-                queue_style(&mut self.stdout, cell.style, self.color_depth)?;
-                last_style = Some(cell.style);
-            }
-            queue!(self.stdout, Print(cell.symbol.as_str()))?;
+            queue!(
+                self.stdout,
+                ResetColor,
+                SetAttribute(Attribute::Reset),
+                EndSynchronizedUpdate
+            )?;
+            self.stdout.flush()?;
         }
-
-        queue!(
-            self.stdout,
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            EndSynchronizedUpdate
-        )?;
-        self.stdout.flush()?;
 
         std::mem::swap(&mut self.current, &mut self.previous);
         self.current.reset();
         Ok(())
+    }
+}
+
+impl crate::SltBackend for TerminalBackend {
+    fn resize(&mut self, width: u32, height: u32) -> io::Result<()> {
+        let area = Rect::new(0, 0, width, height);
+        if self.current.area != area {
+            self.current.resize(area);
+            self.previous.resize(area);
+            execute!(self.stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+        }
+        Ok(())
+    }
+
+    fn frame_buffer(&self) -> &Buffer {
+        // flush() swaps the just-rendered frame into `previous`.
+        &self.previous
+    }
+}
+
+/// Reject URLs that could smuggle control bytes into the OSC 8 payload.
+fn valid_osc8_url(url: &str) -> bool {
+    url.bytes().all(|byte| !byte.is_ascii_control())
+}
+
+fn queue_osc8(stdout: &mut impl Write, link: Option<&str>) -> io::Result<()> {
+    match link {
+        Some(url) => write!(stdout, "\x1b]8;;{url}\x1b\\"),
+        None => write!(stdout, "\x1b]8;;\x1b\\"),
     }
 }
 
@@ -353,59 +499,9 @@ fn to_crossterm_color(color: Color, color_depth: ColorDepth) -> CtColor {
     }
 }
 
-fn init_terminal_context(world: &mut World) {
-    let config = RunConfig::default().mouse(true);
-    match SltContext::init_with(config) {
-        Ok(context) => {
-            world.insert_non_send_resource(context);
-        }
-        Err(error) => {
-            eprintln!("failed to initialize SLT terminal: {error}");
-        }
-    }
-}
-
-fn poll_terminal_events(context: Option<NonSendMut<SltContext>>, mut exit: MessageWriter<AppExit>) {
-    let Some(mut context) = context else {
-        return;
-    };
-
-    while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
-        let Ok(raw) = event::read() else {
-            continue;
-        };
-        let Some(event) = to_slt_event(raw) else {
-            continue;
-        };
-
-        if is_exit_event(&event) {
-            exit.write(AppExit::Success);
-        }
-        context.push_event(event);
-    }
-}
-
-fn is_exit_event(event: &Event) -> bool {
-    match event {
-        Event::Key(key) => key.is_char('q') || key.is_code(KeyCode::Esc) || key.is_ctrl_char('c'),
-        _ => false,
-    }
-}
-
 fn to_slt_event(raw: event::Event) -> Option<Event> {
     match raw {
-        event::Event::Key(key) => {
-            if key.kind == event::KeyEventKind::Release {
-                return None;
-            }
-            let code = to_key_code(key.code)?;
-            let modifiers = to_key_modifiers(key.modifiers);
-            Some(match code {
-                KeyCode::Char(c) => Event::key_mod(KeyCode::Char(c), modifiers),
-                code if modifiers == KeyModifiers::NONE => Event::key(code),
-                _ => Event::key_mod(code, modifiers),
-            })
-        }
+        event::Event::Key(key) => to_slt_key_event(key),
         event::Event::Mouse(mouse) => Some(Event::Mouse(MouseEvent::new(
             to_mouse_kind(mouse.kind),
             u32::from(mouse.column),
@@ -420,6 +516,24 @@ fn to_slt_event(raw: event::Event) -> Option<Event> {
         event::Event::Paste(text) => Some(Event::Paste(text)),
         event::Event::FocusGained => Some(Event::FocusGained),
         event::Event::FocusLost => Some(Event::FocusLost),
+    }
+}
+
+fn to_slt_key_event(key: event::KeyEvent) -> Option<Event> {
+    let code = to_key_code(key.code)?;
+    let modifiers = to_key_modifiers(key.modifiers);
+    match key.kind {
+        // slt's KeyEvent is #[non_exhaustive], so events can only be built
+        // through its constructors: key_mod (Press) and key_release (bare
+        // char Release). Repeat collapses to Press, and releases that the
+        // API cannot express are dropped.
+        event::KeyEventKind::Press | event::KeyEventKind::Repeat => {
+            Some(Event::key_mod(code, modifiers))
+        }
+        event::KeyEventKind::Release => match code {
+            KeyCode::Char(c) if modifiers == KeyModifiers::NONE => Some(Event::key_release(c)),
+            _ => None,
+        },
     }
 }
 
@@ -450,8 +564,28 @@ fn to_key_code(code: event::KeyCode) -> Option<KeyCode> {
         event::KeyCode::Pause => KeyCode::Pause,
         event::KeyCode::Menu => KeyCode::Menu,
         event::KeyCode::KeypadBegin => KeyCode::KeypadBegin,
-        event::KeyCode::Media(_) | event::KeyCode::Modifier(_) => return None,
+        event::KeyCode::Modifier(modifier) => KeyCode::Modifier(to_modifier_key(modifier)),
+        event::KeyCode::Media(_) => return None,
     })
+}
+
+fn to_modifier_key(modifier: event::ModifierKeyCode) -> ModifierKey {
+    match modifier {
+        event::ModifierKeyCode::LeftShift => ModifierKey::LeftShift,
+        event::ModifierKeyCode::LeftControl => ModifierKey::LeftCtrl,
+        event::ModifierKeyCode::LeftAlt => ModifierKey::LeftAlt,
+        event::ModifierKeyCode::LeftSuper => ModifierKey::LeftSuper,
+        event::ModifierKeyCode::LeftHyper => ModifierKey::LeftHyper,
+        event::ModifierKeyCode::LeftMeta => ModifierKey::LeftMeta,
+        event::ModifierKeyCode::RightShift => ModifierKey::RightShift,
+        event::ModifierKeyCode::RightControl => ModifierKey::RightCtrl,
+        event::ModifierKeyCode::RightAlt => ModifierKey::RightAlt,
+        event::ModifierKeyCode::RightSuper => ModifierKey::RightSuper,
+        event::ModifierKeyCode::RightHyper => ModifierKey::RightHyper,
+        event::ModifierKeyCode::RightMeta => ModifierKey::RightMeta,
+        event::ModifierKeyCode::IsoLevel3Shift => ModifierKey::IsoLevel3Shift,
+        event::ModifierKeyCode::IsoLevel5Shift => ModifierKey::IsoLevel5Shift,
+    }
 }
 
 fn to_key_modifiers(modifiers: event::KeyModifiers) -> KeyModifiers {
@@ -495,5 +629,105 @@ fn to_mouse_button(button: event::MouseButton) -> MouseButton {
         event::MouseButton::Left => MouseButton::Left,
         event::MouseButton::Right => MouseButton::Right,
         event::MouseButton::Middle => MouseButton::Middle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{to_slt_event, valid_osc8_url};
+    use crossterm::event::{self, KeyEventKind, KeyEventState};
+    use slt::{Event, KeyCode, KeyEventKind as SltKeyEventKind, KeyModifiers};
+
+    fn key_event(
+        code: event::KeyCode,
+        modifiers: event::KeyModifiers,
+        kind: KeyEventKind,
+    ) -> event::Event {
+        event::Event::Key(event::KeyEvent {
+            code,
+            modifiers,
+            kind,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn press_preserves_modifiers() {
+        let event = to_slt_event(key_event(
+            event::KeyCode::Char('c'),
+            event::KeyModifiers::CONTROL,
+            KeyEventKind::Press,
+        ))
+        .expect("press must convert");
+
+        let Event::Key(key) = event else {
+            panic!("expected key event");
+        };
+        assert!(key.is_ctrl_char('c'));
+        assert_eq!(key.kind, SltKeyEventKind::Press);
+    }
+
+    #[test]
+    fn bare_char_release_preserves_kind() {
+        let event = to_slt_event(key_event(
+            event::KeyCode::Char('x'),
+            event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ))
+        .expect("bare char release must convert");
+
+        let Event::Key(key) = event else {
+            panic!("expected key event");
+        };
+        assert_eq!(key.code, KeyCode::Char('x'));
+        assert_eq!(key.kind, SltKeyEventKind::Release);
+    }
+
+    #[test]
+    fn inexpressible_release_is_dropped() {
+        // slt has no public constructor for non-char or modified releases.
+        let dropped = to_slt_event(key_event(
+            event::KeyCode::Esc,
+            event::KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(dropped.is_none());
+    }
+
+    #[test]
+    fn repeat_collapses_to_press() {
+        let event = to_slt_event(key_event(
+            event::KeyCode::Char('w'),
+            event::KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ))
+        .expect("repeat must convert");
+
+        let Event::Key(key) = event else {
+            panic!("expected key event");
+        };
+        assert_eq!(key.kind, SltKeyEventKind::Press);
+    }
+
+    #[test]
+    fn modifier_keys_are_translated() {
+        let event = to_slt_event(key_event(
+            event::KeyCode::Modifier(event::ModifierKeyCode::LeftShift),
+            event::KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ))
+        .expect("modifier key must convert");
+
+        let Event::Key(key) = event else {
+            panic!("expected key event");
+        };
+        assert!(matches!(key.code, KeyCode::Modifier(_)));
+        assert_eq!(key.modifiers, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn osc8_urls_reject_control_bytes() {
+        assert!(valid_osc8_url("https://example.com"));
+        assert!(!valid_osc8_url("https://example.com/\x1b]evil"));
     }
 }
